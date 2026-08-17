@@ -14,16 +14,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
+      - name: Verify Docker Hub secrets are set
+        run: |
+          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            echo "::error::DOCKERHUB_USERNAME secret is empty or not set."
+            exit 1
+          fi
+          if [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "::error::DOCKERHUB_TOKEN secret is empty or not set."
+            exit 1
+          fi
+          # GitHub masks secret values in logs, so the name prints as ***.
+          echo "Both secrets are set. Pushing to namespace: ${{ secrets.DOCKERHUB_USERNAME }}"
 
-      - name: Restore dependencies
-        run: dotnet restore
-
-      - name: Build application
-        run: dotnet build --no-restore --configuration Release
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -31,8 +36,15 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build Docker image
-        run: docker build -t faisalfarooq007/blazorapp1:latest .
-
-      - name: Push Docker image
-        run: docker push faisalfarooq007/blazorapp1:latest
+      # The Dockerfile runs `dotnet restore` + `dotnet publish`, so a compile
+      # error fails this step. No separate dotnet build needed on the runner.
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/blazorapp1:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/blazorapp1:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
