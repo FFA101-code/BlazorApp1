@@ -1,4 +1,4 @@
-name: BlazorApp1 CI
+name: BlazorApp1 CI/CD
 
 on:
   push:
@@ -10,10 +10,12 @@ on:
       - main
 
 jobs:
-  build:
+  build-and-push:
+
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -28,5 +30,14 @@ jobs:
       - name: Build application
         run: dotnet build --no-restore --configuration Release
 
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Build Docker image
-        run: docker build -t blazorapp1:ci .
+        run: docker build -t faisalfarooq007/blazorapp1:latest .
+
+      - name: Push Docker image
+        run: docker push faisalfarooq007/blazorapp1:latest
