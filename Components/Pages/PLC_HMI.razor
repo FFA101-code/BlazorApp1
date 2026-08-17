@@ -1,0 +1,723 @@
+@page "/plc_hmi"
+@page "/plc-hmi"
+@rendermode InteractiveServer
+@implements IDisposable
+@using System.Timers
+@using System.Globalization
+
+<PageTitle>PLC HMI</PageTitle>
+
+<div class="hmi">
+
+    <header class="hmi-bar">
+        <div class="hmi-title">
+            <span class="hmi-logo">PLC</span>
+            <div>
+                <h1>Line 1 &mdash; Mixer Station</h1>
+                <span class="hmi-sub">Station MX-101 &nbsp;|&nbsp; Firmware 2.4.1 &nbsp;|&nbsp; Scan @TickMs ms</span>
+            </div>
+        </div>
+
+        <div class="hmi-bar-right">
+            <div class="state-badge @StateClass">
+                <span class="dot"></span>@StateText
+            </div>
+            <div class="clock">
+                @now.ToString("HH:mm:ss")
+                <span>@now.ToString("ddd dd MMM")</span>
+            </div>
+        </div>
+    </header>
+
+    @if (ActiveAlarms.FirstOrDefault(a => a.Severity == Severity.Trip) is { } trip)
+    {
+        <div class="alarm-banner">
+            <span class="alarm-banner-icon">!</span>
+            <strong>@trip.Code</strong>
+            <span>@trip.Text</span>
+            <span class="alarm-banner-hint">Clear the condition, then press RESET</span>
+        </div>
+    }
+
+    <div class="hmi-grid">
+
+        <!-- ===================== Process values ===================== -->
+        <section class="card gauges">
+            <h2>Process Values</h2>
+
+            <div class="gauge-row">
+                @foreach (var g in Dials)
+                {
+                    <div class="gauge">
+                        <svg viewBox="0 0 100 100" class="dial @g.Zone">
+                            <circle cx="50" cy="50" r="42" class="dial-track"
+                                    stroke-dasharray="@DialTrack" transform="rotate(135 50 50)" />
+                            <circle cx="50" cy="50" r="42" class="dial-value"
+                                    stroke-dasharray="@DialArc(g.Value, g.Max)" transform="rotate(135 50 50)" />
+                            <text x="50" y="52" class="dial-num">@g.Value.ToString(g.Format, CultureInfo.InvariantCulture)</text>
+                            <text x="50" y="66" class="dial-unit">@g.Unit</text>
+                        </svg>
+                        <span class="gauge-label">@g.Label</span>
+                    </div>
+                }
+            </div>
+
+            <div class="bars">
+                @foreach (var b in Bars)
+                {
+                    <div class="bar-block">
+                        <div class="row-label">
+                            <span>@b.Label</span>
+                            <span class="row-val">@b.Value.ToString(b.Format, CultureInfo.InvariantCulture) @b.Unit</span>
+                        </div>
+                        <div class="bar">
+                            <div class="bar-fill @b.Zone" style="width:@Pct(b.Value, b.Max)"></div>
+                        </div>
+                    </div>
+                }
+            </div>
+
+            <div class="trend">
+                <div class="trend-head">
+                    <span>Trend &mdash; last @HistoryLength samples</span>
+                    <span class="legend"><i class="k-temp"></i>Temp <i class="k-speed"></i>Speed</span>
+                </div>
+                <svg viewBox="0 0 320 90" preserveAspectRatio="none" role="img" aria-label="Temperature and speed trend">
+                    <line x1="0" y1="22" x2="320" y2="22" class="grid" />
+                    <line x1="0" y1="45" x2="320" y2="45" class="grid" />
+                    <line x1="0" y1="68" x2="320" y2="68" class="grid" />
+                    <polyline class="line-speed" points="@Points(speedHistory, 100)" />
+                    <polyline class="line-temp" points="@Points(tempHistory, 120)" />
+                </svg>
+            </div>
+        </section>
+
+        <!-- ===================== Control ===================== -->
+        <section class="card control">
+            <h2>Machine Control</h2>
+
+            <div class="mode-switch">
+                <button class="mode @(mode == OpMode.Manual ? "on" : "")"
+                        @onclick="() => SetMode(OpMode.Manual)"
+                        disabled="@ModeLocked">
+                    MANUAL
+                </button>
+                <button class="mode @(mode == OpMode.Auto ? "on" : "")"
+                        @onclick="() => SetMode(OpMode.Auto)"
+                        disabled="@ModeLocked">
+                    AUTO
+                </button>
+            </div>
+
+            <div class="setpoint">
+                <div class="row-label">
+                    <span>Speed Setpoint</span>
+                    <span class="row-val">@setpoint.ToString("0", CultureInfo.InvariantCulture) %</span>
+                </div>
+                <input type="range" min="0" max="100" step="5"
+                       @bind="setpoint" @bind:event="oninput"
+                       disabled="@(mode == OpMode.Auto)" />
+                <div class="preset-row">
+                    @foreach (var p in Presets)
+                    {
+                        <button class="preset @(Math.Abs(setpoint - p) < 0.1 ? "on" : "")"
+                                disabled="@(mode == OpMode.Auto)"
+                                @onclick="() => setpoint = p">
+                            @p%
+                        </button>
+                    }
+                </div>
+                @if (mode == OpMode.Auto)
+                {
+                    <p class="hint">Auto recipe running &mdash; step @(autoStep + 1)/@autoRecipe.Length, target @autoRecipe[autoStep] %</p>
+                }
+            </div>
+
+            <div class="btn-grid">
+                <button class="btn start" @onclick="Start" disabled="@(!CanStart)">
+                    <span class="glyph">&#9654;</span>START
+                </button>
+                <button class="btn stop" @onclick="Stop" disabled="@(!CanStop)">
+                    <span class="glyph">&#9632;</span>STOP
+                </button>
+                <button class="btn estop" @onclick="EmergencyStop" disabled="@emergencyStop">
+                    <span class="glyph">&#9888;</span>E-STOP
+                </button>
+                <button class="btn reset" @onclick="Reset" disabled="@(!CanReset)">
+                    <span class="glyph">&#8635;</span>RESET
+                </button>
+            </div>
+
+            <h3>Interlocks</h3>
+            <div class="interlocks">
+                @foreach (var i in Interlocks)
+                {
+                    <div class="ilk">
+                        <span>@i.Label</span>
+                        <span class="ilk-state @(i.Ok ? "ilk-ok" : "ilk-bad")">@(i.Ok ? i.OkText : i.BadText)</span>
+                    </div>
+                }
+            </div>
+
+            <h3>Field Simulation</h3>
+            <div class="sim">
+                <label class="toggle">
+                    <input type="checkbox" checked="@guardClosed" @onchange="ToggleGuard" />
+                    <span>Guard door closed</span>
+                </label>
+                <label class="toggle">
+                    <input type="checkbox" checked="@refillPump" @onchange="e => refillPump = (bool)e.Value!" />
+                    <span>Refill pump enabled</span>
+                </label>
+                <label class="toggle">
+                    <input type="checkbox" checked="@coolingOn" @onchange="e => coolingOn = (bool)e.Value!" />
+                    <span>Cooling fan enabled</span>
+                </label>
+                <button class="link-btn" @onclick="InjectHeat">Inject heat disturbance</button>
+            </div>
+        </section>
+
+        <!-- ===================== I/O + production ===================== -->
+        <section class="card io">
+            <h2>Digital I/O</h2>
+            <div class="io-grid">
+                @foreach (var io in DigitalIo)
+                {
+                    <div class="io-item">
+                        <span class="led @(io.On ? "led-on" : "led-off")"></span>
+                        <span>@io.Label</span>
+                    </div>
+                }
+            </div>
+
+            <h2 class="mt">Production</h2>
+            <div class="kpi-grid">
+                <div class="kpi">
+                    <span class="kpi-val">@partsProduced</span>
+                    <span class="kpi-lbl">Parts</span>
+                </div>
+                <div class="kpi">
+                    <span class="kpi-val">@Rate.ToString("0", CultureInfo.InvariantCulture)</span>
+                    <span class="kpi-lbl">Parts / hr</span>
+                </div>
+                <div class="kpi">
+                    <span class="kpi-val">@FormatSpan(runtime)</span>
+                    <span class="kpi-lbl">Runtime</span>
+                </div>
+                <div class="kpi">
+                    <span class="kpi-val">@cycleCount</span>
+                    <span class="kpi-lbl">Start cycles</span>
+                </div>
+                <div class="kpi">
+                    <span class="kpi-val">@Availability.ToString("0", CultureInfo.InvariantCulture)%</span>
+                    <span class="kpi-lbl">Availability</span>
+                </div>
+                <div class="kpi">
+                    <span class="kpi-val">@faultCount</span>
+                    <span class="kpi-lbl">Trips</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- ===================== Alarms ===================== -->
+        <section class="card alarms">
+            <div class="alarms-head">
+                <h2>Alarms &amp; Events</h2>
+                <div class="alarm-actions">
+                    <span class="pill">@ActiveAlarms.Count active</span>
+                    <span class="pill muted">@alarms.Count(a => !a.Acked) unacknowledged</span>
+                    <button class="link-btn" @onclick="AckAll" disabled="@(!alarms.Any(a => !a.Acked))">Acknowledge all</button>
+                    <button class="link-btn" @onclick="ClearReturned" disabled="@(!alarms.Any(a => !a.Active))">Clear returned</button>
+                </div>
+            </div>
+
+            @if (alarms.Count == 0)
+            {
+                <p class="empty">No alarms or events recorded.</p>
+            }
+            else
+            {
+                <div class="table-scroll">
+                    <table class="alarm-table">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Code</th>
+                                <th>Severity</th>
+                                <th>Description</th>
+                                <th>State</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var a in alarms.OrderByDescending(x => x.Time).Take(12))
+                            {
+                                <tr class="@(a.Active ? "row-active" : "row-returned")">
+                                    <td class="mono">@a.Time.ToString("HH:mm:ss")</td>
+                                    <td class="mono">@a.Code</td>
+                                    <td>
+                                        <span class="sev sev-@a.Severity.ToString().ToLowerInvariant()">
+                                            @a.Severity.ToString().ToUpperInvariant()
+                                        </span>
+                                    </td>
+                                    <td>@a.Text</td>
+                                    <td>@(a.Active ? "Active" : "Returned")</td>
+                                    <td>
+                                        @if (!a.Acked)
+                                        {
+                                            <button class="link-btn" @onclick="() => a.Acked = true">ACK</button>
+                                        }
+                                        else
+                                        {
+                                            <span class="muted">acked</span>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </section>
+    </div>
+</div>
+
+@code {
+    // ---------------- model ----------------
+    private enum MachineState { Stopped, Starting, Running, Stopping, Fault }
+    private enum OpMode { Manual, Auto }
+    private enum Severity { Info, Warning, Trip }
+
+    private sealed class Alarm
+    {
+        public string Code { get; init; } = "";
+        public string Text { get; init; } = "";
+        public Severity Severity { get; init; }
+        public DateTime Time { get; init; }
+        public bool Active { get; set; } = true;
+        public bool Acked { get; set; }
+    }
+
+    // ---------------- limits ----------------
+    private const double TempWarnHigh = 85;
+    private const double TempTripHigh = 98;
+    private const double LevelWarnLow = 20;
+    private const double LevelTripLow = 8;
+    private const double VibWarnHigh = 5.0;
+    private const double VibTripHigh = 6.8;
+    private const double Ambient = 24;
+    private const int TickMs = 250;
+    private const int HistoryLength = 80;
+
+    private static readonly int[] Presets = { 25, 50, 75, 100 };
+
+    // ---------------- process state ----------------
+    private MachineState state = MachineState.Stopped;
+    private OpMode mode = OpMode.Manual;
+
+    private double setpoint = 60;
+    private double actualSpeed;
+    private double temperature = Ambient;
+    private double pressure;
+    private double vibration;
+    private double level = 82;
+    private double load;
+    private double injectedHeat;
+
+    private bool emergencyStop;
+    private bool guardClosed = true;
+    private bool refillPump = true;
+    private bool coolingOn = true;
+    private bool pumpRunning;
+    private bool coolingActive;
+
+    private int partsProduced;
+    private int cycleCount;
+    private int faultCount;
+    private double partsFraction;
+    private TimeSpan runtime;
+    private TimeSpan poweredOn;
+    private DateTime now = DateTime.Now;
+
+    private readonly List<Alarm> alarms = new();
+    private readonly List<double> tempHistory = new();
+    private readonly List<double> speedHistory = new();
+
+    private readonly int[] autoRecipe = { 40, 70, 95, 55 };
+    private int autoStep;
+    private int autoStepTicks;
+
+    private readonly System.Timers.Timer timer = new(TickMs);
+
+    // ---------------- derived state ----------------
+    private bool MotorRunning => actualSpeed > 0.5;
+
+    private IReadOnlyList<Alarm> ActiveAlarms => alarms.Where(a => a.Active).ToList();
+
+    private bool CanStart => state == MachineState.Stopped && !emergencyStop && guardClosed
+                             && level > LevelTripLow && setpoint > 0;
+    private bool CanStop => state is MachineState.Running or MachineState.Starting;
+    private bool CanReset => state == MachineState.Fault || emergencyStop;
+    private bool ModeLocked => state is MachineState.Running or MachineState.Starting or MachineState.Stopping;
+
+    private double Rate => runtime.TotalHours > 0.0005 ? partsProduced / runtime.TotalHours : 0;
+    private double Availability => poweredOn.TotalSeconds > 1 ? runtime.TotalSeconds / poweredOn.TotalSeconds * 100 : 0;
+
+    private string StateText => state switch
+    {
+        MachineState.Running => "RUNNING",
+        MachineState.Starting => "STARTING",
+        MachineState.Stopping => "STOPPING",
+        MachineState.Fault => emergencyStop ? "EMERGENCY STOP" : "FAULT",
+        _ => emergencyStop ? "EMERGENCY STOP" : "STOPPED"
+    };
+
+    private string StateClass => state switch
+    {
+        MachineState.Running => "s-run",
+        MachineState.Starting or MachineState.Stopping => "s-transition",
+        MachineState.Fault => "s-fault",
+        _ => emergencyStop ? "s-fault" : "s-idle"
+    };
+
+    private string TempZone => temperature >= TempTripHigh ? "z-trip" : temperature >= TempWarnHigh ? "z-warn" : "z-ok";
+    private string SpeedZone => actualSpeed > 90 ? "z-warn" : "z-ok";
+    private string PressureZone => pressure >= 5.2 ? "z-trip" : pressure >= 4.4 ? "z-warn" : "z-ok";
+    private string LevelZone => level <= LevelTripLow ? "z-trip" : level <= LevelWarnLow ? "z-warn" : "z-ok";
+    private string VibZone => vibration >= VibTripHigh ? "z-trip" : vibration >= VibWarnHigh ? "z-warn" : "z-ok";
+    private string LoadZone => load >= 92 ? "z-trip" : load >= 78 ? "z-warn" : "z-ok";
+
+    // ---------------- view models ----------------
+    private (string Label, double Value, double Max, string Unit, string Format, string Zone)[] Dials =>
+    [
+        ("Motor Speed", actualSpeed, 100, "%", "0", SpeedZone),
+        ("Temperature", temperature, 120, "°C", "0.0", TempZone),
+        ("Pressure", pressure, 6, "bar", "0.00", PressureZone)
+    ];
+
+    private (string Label, double Value, double Max, string Unit, string Format, string Zone)[] Bars =>
+    [
+        ("Tank Level", level, 100, "%", "0.0", LevelZone),
+        ("Vibration", vibration, 8, "mm/s", "0.00", VibZone),
+        ("Drive Load", load, 100, "%", "0", LoadZone)
+    ];
+
+    private (string Label, bool On)[] DigitalIo =>
+    [
+        ("Q0.0 Motor", MotorRunning),
+        ("Q0.1 Refill pump", pumpRunning),
+        ("Q0.2 Cooling fan", coolingActive),
+        ("Q0.3 Alarm beacon", ActiveAlarms.Count > 0),
+        ("I0.0 Guard closed", guardClosed),
+        ("I0.1 E-Stop healthy", !emergencyStop),
+        ("I0.2 Level switch", level >= LevelWarnLow),
+        ("I0.3 Run feedback", state == MachineState.Running)
+    ];
+
+    private (string Label, bool Ok, string OkText, string BadText)[] Interlocks =>
+    [
+        ("Emergency Stop", !emergencyStop, "Released", "ACTIVE"),
+        ("Guard Door", guardClosed, "Closed", "OPEN"),
+        ("Tank Level", level > LevelTripLow, "OK", "LOW"),
+        ("Faults", state != MachineState.Fault, "None", "LATCHED"),
+        ("Ready to Start", CanStart, "Yes", "No")
+    ];
+
+    // ---------------- lifecycle ----------------
+    protected override void OnInitialized()
+    {
+        for (var i = 0; i < HistoryLength; i++)
+        {
+            tempHistory.Add(Ambient);
+            speedHistory.Add(0);
+        }
+
+        Log("SYS-001", "Controller powered on, PLC in RUN mode", Severity.Info, autoReturn: true);
+
+        timer.Elapsed += OnTick;
+        timer.AutoReset = true;
+        timer.Start();
+    }
+
+    private void OnTick(object? sender, ElapsedEventArgs e)
+    {
+        const double dt = TickMs / 1000.0;
+
+        now = DateTime.Now;
+        poweredOn += TimeSpan.FromSeconds(dt);
+
+        AdvanceAuto();
+        AdvanceStateMachine(dt);
+        UpdateProcess(dt);
+        EvaluateAlarms();
+        PushHistory();
+
+        InvokeAsync(StateHasChanged);
+    }
+
+    // ---------------- simulation ----------------
+    private void AdvanceAuto()
+    {
+        if (mode != OpMode.Auto || state != MachineState.Running) return;
+
+        if (++autoStepTicks >= 40)              // ~10 s per recipe step
+        {
+            autoStepTicks = 0;
+            autoStep = (autoStep + 1) % autoRecipe.Length;
+        }
+        setpoint = autoRecipe[autoStep];
+    }
+
+    private void AdvanceStateMachine(double dt)
+    {
+        switch (state)
+        {
+            case MachineState.Starting:
+                actualSpeed = Approach(actualSpeed, setpoint, 45 * dt);
+                if (Math.Abs(actualSpeed - setpoint) < 1.5)
+                {
+                    actualSpeed = setpoint;
+                    state = MachineState.Running;
+                    Log("EVT-102", "Ramp complete, running at setpoint", Severity.Info, autoReturn: true);
+                }
+                break;
+
+            case MachineState.Running:
+                actualSpeed = Approach(actualSpeed, setpoint, 30 * dt);
+                runtime += TimeSpan.FromSeconds(dt);
+                break;
+
+            case MachineState.Stopping:
+                actualSpeed = Approach(actualSpeed, 0, 60 * dt);
+                if (actualSpeed <= 0.4)
+                {
+                    actualSpeed = 0;
+                    state = MachineState.Stopped;
+                    Log("EVT-103", "Machine stopped, drive at zero speed", Severity.Info, autoReturn: true);
+                }
+                break;
+
+            default:
+                actualSpeed = Approach(actualSpeed, 0, 90 * dt);
+                break;
+        }
+    }
+
+    private void UpdateProcess(double dt)
+    {
+        var noise = Random.Shared.NextDouble() - 0.5;
+
+        // Thermal model: drive heat in, cooling fan and ambient out.
+        coolingActive = coolingOn && temperature > 45;
+        var target = Ambient + actualSpeed * 0.62 + injectedHeat - (coolingActive ? 8 : 0);
+        temperature += (target - temperature) * 0.9 * dt + noise * 0.25;
+        temperature = Math.Max(Ambient - 1, temperature);
+        injectedHeat = Approach(injectedHeat, 0, 4 * dt);
+
+        pressure = Math.Max(0, actualSpeed * 0.048 + noise * 0.05);
+        vibration = Math.Max(0, actualSpeed * 0.045
+                                + (actualSpeed > 85 ? (actualSpeed - 85) * 0.13 : 0)
+                                + noise * 0.2);
+        load = Math.Clamp(actualSpeed * 0.85 + pressure * 3 + noise * 2, 0, 100);
+
+        // Tank drains while producing; the refill pump tops it back up.
+        level -= actualSpeed * 0.015 * dt;
+        pumpRunning = refillPump && level < 45;
+        if (pumpRunning) level += 3.5 * dt;
+        level = Math.Clamp(level, 0, 100);
+
+        if (state == MachineState.Running)
+        {
+            partsFraction += actualSpeed * 0.02 * dt;
+            while (partsFraction >= 1)
+            {
+                partsFraction -= 1;
+                partsProduced++;
+            }
+        }
+    }
+
+    private void EvaluateAlarms()
+    {
+        Condition("TMP-301", $"Motor temperature high ({Fmt(temperature, "0.0")} °C)",
+                  Severity.Warning, temperature >= TempWarnHigh && temperature < TempTripHigh);
+        Condition("LVL-310", $"Tank level low ({Fmt(level, "0.0")} %)",
+                  Severity.Warning, level <= LevelWarnLow && level > LevelTripLow);
+        Condition("VIB-320", $"Vibration above warning limit ({Fmt(vibration, "0.00")} mm/s)",
+                  Severity.Warning, vibration >= VibWarnHigh && vibration < VibTripHigh);
+
+        if (state is MachineState.Running or MachineState.Starting)
+        {
+            if (temperature >= TempTripHigh)
+                Trip("TMP-302", $"Over-temperature trip at {Fmt(temperature, "0.0")} °C");
+            else if (level <= LevelTripLow)
+                Trip("LVL-311", $"Tank level below minimum ({Fmt(level, "0.0")} %)");
+            else if (vibration >= VibTripHigh)
+                Trip("VIB-321", $"Vibration trip at {Fmt(vibration, "0.00")} mm/s");
+        }
+    }
+
+    private void PushHistory()
+    {
+        tempHistory.Add(temperature);
+        speedHistory.Add(actualSpeed);
+        if (tempHistory.Count > HistoryLength) tempHistory.RemoveAt(0);
+        if (speedHistory.Count > HistoryLength) speedHistory.RemoveAt(0);
+    }
+
+    // ---------------- commands ----------------
+    private void Start()
+    {
+        if (!CanStart) return;
+        state = MachineState.Starting;
+        cycleCount++;
+        Log("EVT-101", $"Start command accepted, ramping to {Fmt(setpoint, "0")} %", Severity.Info, autoReturn: true);
+    }
+
+    private void Stop()
+    {
+        if (!CanStop) return;
+        state = MachineState.Stopping;
+        Log("EVT-104", "Stop command accepted, ramping down", Severity.Info, autoReturn: true);
+    }
+
+    private void EmergencyStop()
+    {
+        emergencyStop = true;
+        actualSpeed = 0;
+        state = MachineState.Fault;
+        faultCount++;
+        Log("ESD-001", "EMERGENCY STOP pressed — all outputs de-energised", Severity.Trip);
+    }
+
+    private void Reset()
+    {
+        if (!CanReset) return;
+
+        if (!guardClosed)
+        {
+            Log("ILK-202", "Reset refused — close the guard door first", Severity.Warning);
+            return;
+        }
+
+        emergencyStop = false;
+        foreach (var a in alarms.Where(a => a.Severity == Severity.Trip && a.Active))
+        {
+            a.Active = false;
+        }
+
+        state = MachineState.Stopped;
+        autoStep = 0;
+        autoStepTicks = 0;
+        Log("EVT-105", "Faults reset, machine ready", Severity.Info, autoReturn: true);
+    }
+
+    private void Trip(string code, string text)
+    {
+        if (state == MachineState.Fault) return;
+        state = MachineState.Fault;
+        actualSpeed = 0;
+        faultCount++;
+        Log(code, text, Severity.Trip);
+    }
+
+    private void SetMode(OpMode m)
+    {
+        if (mode == m || ModeLocked) return;
+        mode = m;
+        autoStep = 0;
+        autoStepTicks = 0;
+        if (m == OpMode.Auto) setpoint = autoRecipe[0];
+        Log("EVT-110", $"Operating mode changed to {m.ToString().ToUpperInvariant()}", Severity.Info, autoReturn: true);
+    }
+
+    private void ToggleGuard(ChangeEventArgs e)
+    {
+        guardClosed = (bool)e.Value!;
+        if (!guardClosed && state is MachineState.Running or MachineState.Starting)
+        {
+            Trip("ILK-201", "Guard door opened while running");
+        }
+    }
+
+    private void InjectHeat()
+    {
+        injectedHeat += 45;
+        Log("SIM-900", "Simulated heat disturbance injected", Severity.Info, autoReturn: true);
+    }
+
+    private void AckAll()
+    {
+        foreach (var a in alarms) a.Acked = true;
+    }
+
+    private void ClearReturned() => alarms.RemoveAll(a => !a.Active);
+
+    // ---------------- alarm helpers ----------------
+    private void Log(string code, string text, Severity sev, bool autoReturn = false)
+    {
+        alarms.Add(new Alarm
+        {
+            Code = code,
+            Text = text,
+            Severity = sev,
+            Time = DateTime.Now,
+            Active = !autoReturn,
+            Acked = autoReturn
+        });
+
+        if (alarms.Count > 60) alarms.RemoveRange(0, alarms.Count - 60);
+    }
+
+    /// <summary>Raises an alarm on the rising edge and clears it when the condition returns.</summary>
+    private void Condition(string code, string text, Severity sev, bool active)
+    {
+        var existing = alarms.LastOrDefault(a => a.Code == code && a.Active);
+        if (active && existing is null) Log(code, text, sev);
+        else if (!active && existing is not null) existing.Active = false;
+    }
+
+    // ---------------- formatting helpers ----------------
+    private static double Approach(double value, double target, double step)
+        => value < target ? Math.Min(target, value + step) : Math.Max(target, value - step);
+
+    private static string Fmt(double value, string format) => value.ToString(format, CultureInfo.InvariantCulture);
+
+    private static string Pct(double value, double max)
+        => Fmt(Math.Clamp(value / max, 0, 1) * 100, "0.##") + "%";
+
+    private static string FormatSpan(TimeSpan t) => $"{(int)t.TotalHours:00}:{t.Minutes:00}:{t.Seconds:00}";
+
+    // 270° dial drawn as a dash-array arc on a full circle (r = 42).
+    private const double Circumference = 2 * Math.PI * 42;
+    private const double Sweep = 0.75;
+
+    private static string DialTrack => $"{Fmt(Circumference * Sweep, "0.##")} {Fmt(Circumference * (1 - Sweep), "0.##")}";
+
+    private static string DialArc(double value, double max)
+    {
+        var filled = Circumference * Sweep * Math.Clamp(value / max, 0, 1);
+        return $"{Fmt(filled, "0.##")} {Fmt(Circumference - filled, "0.##")}";
+    }
+
+    private static string Points(IReadOnlyList<double> data, double max)
+    {
+        if (data.Count < 2) return string.Empty;
+
+        var sb = new System.Text.StringBuilder();
+        for (var i = 0; i < data.Count; i++)
+        {
+            var x = i / (double)(data.Count - 1) * 320;
+            var y = 88 - Math.Clamp(data[i] / max, 0, 1) * 84;
+            sb.Append(Fmt(x, "0.##")).Append(',').Append(Fmt(y, "0.##")).Append(' ');
+        }
+        return sb.ToString().TrimEnd();
+    }
+
+    public void Dispose()
+    {
+        timer.Elapsed -= OnTick;
+        timer.Stop();
+        timer.Dispose();
+    }
+}

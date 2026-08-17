@@ -1,0 +1,50 @@
+@page "/toggle"
+@rendermode InteractiveServer
+@implements IDisposable
+@using System.Timers
+
+<PageTitle>Start / Stop</PageTitle>
+
+<h1>Start / Stop</h1>
+
+<p role="status">
+    Status: <strong>@(isRunning ? "ON" : "OFF")</strong> &mdash; ticks: @ticks
+</p>
+
+<button class="btn btn-success" @onclick="Start" disabled="@isRunning">Yes (start)</button>
+<button class="btn btn-danger" @onclick="Stop" disabled="@(!isRunning)">Off (stop)</button>
+
+@code {
+    private readonly Timer timer = new(1000);
+    private bool isRunning;
+    private int ticks;
+
+    protected override void OnInitialized()
+    {
+        timer.Elapsed += OnTick;
+    }
+
+    private void Start()
+    {
+        isRunning = true;
+        timer.Start();
+    }
+
+    private void Stop()
+    {
+        isRunning = false;
+        timer.Stop();
+    }
+
+    private void OnTick(object? sender, ElapsedEventArgs e)
+    {
+        ticks++;
+        InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        timer.Elapsed -= OnTick;
+        timer.Dispose();
+    }
+}
